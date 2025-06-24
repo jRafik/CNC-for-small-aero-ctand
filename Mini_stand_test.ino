@@ -3,7 +3,7 @@
 Программа создана для управления ЧПУ маленького стенда, реализовано:
 - перемещение по осям;
 - замер давлений;
-- запись измерений на флешку либо на COM порт;
+- запись измерений на SD карту либо на COM порт;
 - управление энкодором;
 - вывод информации на экран.
 
@@ -21,10 +21,15 @@ D50 (MISO), D52 (SCLK), D53 (SS) датчик 1;
 #define thread_pitch_X 2.0  //шаг резьбы винта, [мм]
 #define thread_pitch_Z 2.0  //шаг резьбы винта, [мм]
 #define BTN_PIN 18          //пин кнопки энкодера
-#define MY_PERIOD 150       //время обновления экрана в миллисекундах (1 с = 1000 мс)
+#define MY_PERIOD 300       //время обновления экрана в миллисекундах (1 с = 1000 мс)
 #define CLK 2               //пин энкодера
 #define DT 3                //пин энкодера
 #define SW 18               //пин кнопки энкодера
+#define X_max 220.0           //ограничение по X, мм 220
+#define Z_max 210.0           //ограничение по Z, мм 210
+
+#define LIMSW_X 24  // концевик на D24
+#define LIMSW_Z 26  // концевик на D26
 
 //**************************Библиотеки****************************
 
@@ -43,6 +48,9 @@ GStepper2< STEPPER2WIRE> stepper_Z(400, 6, 9);  // драйвер step-dir
 float x_position = 0.0;  //позиция по X
 float z_position = 0.0;  //позиция по Z
 
+float x_position_abs = 0.0;  //позиция абсолютная по X
+float z_position_abs = 0.0;  //позиция абсолютная по Z
+
 float one_measure_deg_X = 0.0;  //шаг одного измерения по X
 float one_measure_deg_Z = 0.0;  //шаг одного измерения по Z
 
@@ -50,6 +58,9 @@ float one_micromeasure_deg_Z = 0.0;  //шаг одного измерения п
 
 float my_deg_X = 0.0;  //угол по X
 float my_deg_Z = 0.0;  //угол по Z
+
+float my_deg_X_abs = 0.0;  //угол абсолютный по X
+float my_deg_Z_abs = 0.0;  //угол абсолютный по Z
 
 float z_measuring = 0.0;         //высота измерения по Z
 float z_step = 0.0;              //шаг измерения по Z
@@ -67,10 +78,16 @@ float rad = 0.0;
 float step_rad = 0.0;
 float z_corect = 0.0;
 
+float sumX = 0.0;  //для концевика
+float sumZ = 0.0;  //для концевика
+
+byte flag_avto_home = 0;  //флаг перемещения домой
+
 //*************************Датчик давления*************************
 
 Honeywell_SPI PS1(53, 0.915541, -6000, 1638, 10);  //создание объекта датчика
 unsigned int waiting = 0;
+float calibration = 0.0;
 
 //*************************Переменные энкодера*************************
 
@@ -96,8 +113,8 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);  // адрес, столбцов, строк
 
 //******************Переменные для настройки***********************
 
-int max_speed = 1250;
-int max_acceleration = 1250;
+int max_speed = 1500;
+int max_acceleration = 1500;
 
 //******************Переменные для SD карты************************
 
@@ -112,16 +129,27 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.clear();
+  lcd.setCursor(2, 0);
+  lcd.print("Initialization");
+  lcd.setCursor(3, 1);
+  lcd.print("Please wait");
+  lcd.setCursor(1, 3);
+  lcd.print("Powered by jRafik");
   pinMode(48, OUTPUT);
   PS1.begin();
+  PS1.readSensorSum();
+  calibration = PS1.getPressure();
   pinMode(18, INPUT_PULLUP);
   attachInterrupt(0, encIsr, CHANGE);
   attachInterrupt(1, encIsr, CHANGE);
   attachInterrupt(5, isr, FALLING);
+  pinMode(LIMSW_X, INPUT_PULLUP);               //пин концевика X
+  pinMode(LIMSW_Z, INPUT_PULLUP);               //пин концевика Z
   stepper_X.setMaxSpeedDeg(max_speed);          // скорость движения к цели x
   stepper_X.setAcceleration(max_acceleration);  // ускорение x
   stepper_Z.setMaxSpeedDeg(max_speed);          // скорость движения к цели z
   stepper_Z.setAcceleration(max_acceleration);  // ускорение z
+  delay (3000);
 }
 
 void loop() {
@@ -185,7 +213,7 @@ void loop() {
           if (millis() - tmr >= MY_PERIOD) {  // ищем разницу
             tmr = millis();
             cursor();
-            cursor_string = constrain(cursor_string, 0, 2);
+            cursor_string = constrain(cursor_string, 0, 3);
             menu_moveXYZ();
           }
           if (button_flag == 1 && cursor_string == 0) {
@@ -202,6 +230,18 @@ void loop() {
             mode_move_XYZ = 3;
             cursor_string = 0;
             button_flag = 0;
+          }
+          if (button_flag == 1 && cursor_string == 3) {
+            mode_move_XYZ = 13;
+            cursor_string = 0;
+            button_flag = 0;
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please wait...");
+            lcd.setCursor(0, 1);
+            lcd.print("X - move");
+            lcd.setCursor(0, 2);
+            lcd.print("Z - stop");
           }
           break;
 
@@ -258,98 +298,211 @@ void loop() {
           break;
 
         case 4:  //перемещение по X на 10 мм
-          x_position += counter * 10.0;
-          my_deg_X += counter * 1800.0;
+          x_position_abs += counter * 10.0;
+          my_deg_X_abs += counter * 1800.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (x_position_abs <= 0.0) {
+              x_position_abs = 0.0;
+              my_deg_X_abs = 0.0;
+            }
+            if (x_position_abs >= X_max) {
+              x_position_abs = X_max;
+              my_deg_X_abs = 1800.0 * X_max * 0.1;
+            }
+          }
           move_X();
           lcd_print_x();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_X.brake();
+            my_deg_X_abs = stepper_X.getCurrent() * 0.9;
+            x_position_abs = stepper_X.getCurrent() * 0.005;
             mode_move_XYZ = 1;
-            my_deg_X = 0.0;
-            x_position = 0.0;
-            stepper_X.setCurrent(0);
           }
           break;
 
         case 5:  //перемещение по X на 1 мм
-          x_position += counter * 1.0;
-          my_deg_X += counter * 180.0;
+          x_position_abs += counter * 1.0;
+          my_deg_X_abs += counter * 180.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (x_position_abs <= 0.0) {
+              x_position_abs = 0.0;
+              my_deg_X_abs = 0.0;
+            }
+            if (x_position_abs >= X_max) {
+              x_position_abs = X_max;
+              my_deg_X_abs = 1800.0 * X_max * 0.1;
+            }
+          }
           move_X();
           lcd_print_x();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_X.brake();
+            my_deg_X_abs = stepper_X.getCurrent() * 0.9;
+            x_position_abs = stepper_X.getCurrent() * 0.005;
             mode_move_XYZ = 1;
-            my_deg_X = 0.0;
-            x_position = 0.0;
-            stepper_X.setCurrent(0);
           }
           break;
 
         case 6:  //перемещение по X на 0,1 мм
-          x_position += counter * 0.1;
-          my_deg_X += counter * 18.0;
+          x_position_abs += counter * 0.1;
+          my_deg_X_abs += counter * 18.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (x_position_abs <= 0.0) {
+              x_position_abs = 0.0;
+              my_deg_X_abs = 0.0;
+            }
+            if (x_position_abs >= X_max) {
+              x_position_abs = X_max;
+              my_deg_X_abs = 1800.0 * X_max * 0.1;
+            }
+          }
           move_X();
           lcd_print_x();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_X.brake();
+            my_deg_X_abs = stepper_X.getCurrent() * 0.9;
+            x_position_abs = stepper_X.getCurrent() * 0.005;
             mode_move_XYZ = 1;
-            my_deg_X = 0.0;
-            x_position = 0.0;
-            stepper_X.setCurrent(0);
           }
           break;
 
         case 10:  //перемещение по Z на 10 мм
-          z_position += counter * 10.0;
-          my_deg_Z += counter * 1800.0;
+          z_position_abs += counter * 10.0;
+          my_deg_Z_abs += counter * 1800.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (z_position_abs <= 0.0) {
+              z_position_abs = 0.0;
+              my_deg_Z_abs = 0.0;
+            }
+            if (z_position_abs >= Z_max) {
+              z_position_abs = Z_max;
+              my_deg_Z_abs = 1800.0 * Z_max * 0.1;
+            }
+          }
           move_Z();
           lcd_print_z();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_Z.brake();
+            my_deg_Z_abs = stepper_Z.getCurrent() * 0.9;
+            z_position_abs = stepper_Z.getCurrent() * 0.005;
             mode_move_XYZ = 3;
-            my_deg_Z = 0.0;
-            z_position = 0.0;
-            stepper_Z.setCurrent(0);
           }
           break;
 
         case 11:  //перемещение по Z на 1 мм
-          z_position += counter * 1.0;
-          my_deg_Z += counter * 180.0;
+          z_position_abs += counter * 1.0;
+          my_deg_Z_abs += counter * 180.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (z_position_abs <= 0.0) {
+              z_position_abs = 0.0;
+              my_deg_Z_abs = 0.0;
+            }
+            if (z_position_abs >= Z_max) {
+              z_position_abs = Z_max;
+              my_deg_Z_abs = 1800.0 * Z_max * 0.1;
+            }
+          }
           move_Z();
           lcd_print_z();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_Z.brake();
+            my_deg_Z_abs = stepper_Z.getCurrent() * 0.9;
+            z_position_abs = stepper_Z.getCurrent() * 0.005;
             mode_move_XYZ = 3;
-            my_deg_Z = 0.0;
-            z_position = 0.0;
-            stepper_Z.setCurrent(0);
           }
           break;
 
         case 12:  //перемещение по Z на 0,1 мм
-          z_position += counter * 0.1;
-          my_deg_Z += counter * 18.0;
+          z_position_abs += counter * 0.1;
+          my_deg_Z_abs += counter * 18.0;
           counter = 0;
+          if (flag_avto_home == 1) {
+            if (z_position_abs <= 0.0) {
+              z_position_abs = 0.0;
+              my_deg_Z_abs = 0.0;
+            }
+            if (z_position_abs >= Z_max) {
+              z_position_abs = Z_max;
+              my_deg_Z_abs = 1800.0 * Z_max * 0.1;
+            }
+          }
           move_Z();
           lcd_print_z();
           if (button_flag == 1) {
             button_flag = 0;
             stepper_Z.brake();
+            my_deg_Z_abs = stepper_Z.getCurrent() * 0.9;
+            z_position_abs = stepper_Z.getCurrent() * 0.005;
             mode_move_XYZ = 3;
-            my_deg_Z = 0.0;
-            z_position = 0.0;
-            stepper_Z.setCurrent(0);
+          }
+          break;
+
+        case 13:  //возврат в ноль по оси X
+          if (button_flag == 1) {
+            button_flag = 0;
+            stepper_X.brake();
+            mode_move_XYZ = 0;
+          }
+          for (int i = 0; i < 10; i++)     // согласно количеству усреднений
+            sumX += digitalRead(LIMSW_X);  // суммируем значения с любого датчика в переменную sum
+          if ((sumX / 10.0) > 0.1) {       // если концевик X не нажат
+            stepper_X.setSpeed(-1500);     // ось Х, -10 шаг/сек
+            stepper_X.tick();              // крутим
+            sumX = 0;
+          } else {
+            stepper_X.brake();  // тормозим, приехали
+            stepper_X.reset();  // сбрасываем координаты в 0
+            x_position_abs = 0;
+            my_deg_X_abs = 0;
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please wait...");
+            lcd.setCursor(0, 1);
+            lcd.print("X - OK");
+            lcd.setCursor(0, 2);
+            lcd.print("Z - move");
+            mode_move_XYZ = 14;
+          }
+          break;
+
+        case 14:  //возврат в ноль по оси Z
+          if (button_flag == 1) {
+            button_flag = 0;
+            stepper_Z.brake();
+            mode_move_XYZ = 0;
+          }
+          for (int i = 0; i < 10; i++)     // согласно количеству усреднений
+            sumZ += digitalRead(LIMSW_Z);  // суммируем значения с любого датчика в переменную sum
+          if ((sumZ / 10.0) > 0.1) {       // если концевик Z не нажат
+            stepper_Z.setSpeed(-1500);     // ось Х, -10 шаг/сек
+            stepper_Z.tick();              // крутим
+            sumZ = 0;
+          } else {
+            // кнопка нажалась - покидаем цикл
+            stepper_Z.brake();  // тормозим, приехали
+            stepper_Z.reset();  // сбрасываем координаты в 0
+            z_position_abs = 0;
+            my_deg_Z_abs = 0;
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Please wait...");
+            lcd.setCursor(0, 1);
+            lcd.print("X - OK");
+            lcd.setCursor(0, 2);
+            lcd.print("Z - OK");
+            delay(2000);
+            flag_avto_home = 1;
+            mode_move_XYZ = 0;
           }
           break;
       }
@@ -584,11 +737,19 @@ void loop() {
           break;
 
         case 9:
-          stepper_X.reset();
-          stepper_Z.reset();
           one_measure_deg_Z = z_step / (thread_pitch_Z / 360.0);  //расчёт на сколько градусов повернется вал мотора между двумя измерениями
           one_micromeasure_deg_Z = z_step_microstep / (thread_pitch_Z / 360.0);
-          mode_along_Z = 10;
+          lcd.clear();
+          stepper_Z.reset();
+          my_deg_Z = 0.0;
+          if (z_position_abs + z_measuring < Z_max && flag_avto_home == 1) {
+            mode_along_Z = 10;
+          } else {
+            mode_along_Z = 6;
+          }
+          if (flag_avto_home == 0) {
+            mode_along_Z = 10;
+          }
           break;
 
         case 10:
@@ -628,8 +789,9 @@ void loop() {
           if (stepper_Z.ready() == 0) {
             stepper_Z.tick();
           } else {
-            z_position = 0;
-            my_deg_Z = 0;
+            z_position = 0.0;
+            my_deg_Z = 0.0;
+            stepper_Z.setCurrent(my_deg_Z_abs);
             card_flag = 0;
             mode_along_Z = 6;
           }
@@ -886,7 +1048,17 @@ void loop() {
           stepper_Z.reset();
           one_measure_deg_Z = z_step / (thread_pitch_Z / 360.0);  //расчёт на сколько градусов повернется вал мотора между двумя измерениями
           one_measure_deg_X = x_step / (thread_pitch_X / 360.0);  //расчёт на сколько градусов повернется вал мотора между двумя измерениями
-          mode_along_XZ = 15;
+          my_deg_X = 0.0;
+          my_deg_Z = 0.0;
+          lcd.clear();
+          if (z_position_abs + z_measuring < Z_max && flag_avto_home == 1 && x_position_abs + x_measuring < X_max) {
+            mode_along_XZ = 15;
+          } else {
+            mode_along_XZ = 12;
+          }
+          if (flag_avto_home == 0) {
+            mode_along_XZ = 15;
+          }
           break;
 
         case 15:  //перемещение по Х
@@ -922,7 +1094,7 @@ void loop() {
           break;
 
         case 17:  //возврат Х в ноль и перемещение Z
-          stepper_X.setTargetDeg(0.0, ABSOLUTE);
+          stepper_X.setTargetDeg(my_deg_X, ABSOLUTE);
           if (stepper_X.ready() == 0) {
             stepper_X.tick();
           } else {
@@ -952,10 +1124,12 @@ void loop() {
           } else if (stepper_X.ready() == 0) {
             stepper_X.tick();
           } else {
-            z_position = 0;
-            my_deg_Z = 0;
-            x_position = 0;
-            my_deg_Z = 0;
+            z_position = 0.0;
+            my_deg_Z = 0.0;
+            x_position = 0.0;
+            my_deg_Z = 0.0;
+            stepper_X.setCurrent(my_deg_X_abs);
+            stepper_Z.setCurrent(my_deg_Z_abs);
             card_flag = 0;
             mode_along_XZ = 12;
           }
@@ -1106,8 +1280,10 @@ void loop() {
           break;
 
         case 8:
-          stepper_X.setCurrent(0);
-          stepper_Z.setCurrent(0);
+          my_deg_X = 0.0;
+          my_deg_Z = 0.0;
+          stepper_X.reset();
+          stepper_Z.reset();
           radius = diameter / 2.0;
           mode_along_cyrcle_XZ = 10;
           break;
@@ -1128,6 +1304,7 @@ void loop() {
           stepper_Z.setTargetDeg(my_deg_Z, ABSOLUTE);
           stepper_X.setTargetDeg(my_deg_X, ABSOLUTE);
           stepper_Z.tick();
+
           stepper_X.tick();
           if (stepper_Z.ready() == 1 && stepper_X.ready() == 1) {
             delay(waiting);
@@ -1158,6 +1335,8 @@ void loop() {
           if (stepper_X.getStatus() == 0 && stepper_Z.getStatus() == 0) {
             cursor_string = 2;
             card_flag = 0;
+            stepper_X.setCurrent(my_deg_X_abs);
+            stepper_Z.setCurrent(my_deg_Z_abs);
             mode_along_cyrcle_XZ = 6;
           }
           break;
@@ -1167,22 +1346,22 @@ void loop() {
 }
 
 void sensor() {
-  PS1.readSensor();
-  /*Serial.print("Pressure: ");
-  Serial.print(PS1.getPressure());
+  PS1.readSensorSum();
+  Serial.print("Pressure: ");
+  Serial.print(PS1.getPressure() - calibration);
   Serial.print(" Pa; Z: ");
   Serial.print(z_position);
   Serial.print(" mm; X: ");
   Serial.print(x_position);
-  Serial.println(" mm.");*/
+  Serial.println(" mm.");
 }
 
 void measuring_results() {
-  lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("X:");
   lcd.setCursor(2, 0);
   lcd.print(x_position);
+  lcd.print("   ");
   lcd.setCursor(10, 0);
   lcd.print("/");
   lcd.setCursor(11, 0);
@@ -1194,6 +1373,7 @@ void measuring_results() {
   lcd.print("Z:");
   lcd.setCursor(2, 1);
   lcd.print(z_position);
+  lcd.print("   ");
   lcd.setCursor(10, 1);
   lcd.print("/");
   lcd.setCursor(11, 1);
@@ -1204,17 +1384,18 @@ void measuring_results() {
   lcd.setCursor(0, 2);
   lcd.print("Pt:");
   lcd.setCursor(3, 2);
-  lcd.print(PS1.getPressure());
+  lcd.print(PS1.getPressure() - calibration);
+  lcd.print("   ");
   lcd.setCursor(18, 2);
   lcd.print("Pa");
 }
 
 void measuring_results_circle() {
-  lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("D:");
   lcd.setCursor(2, 0);
   lcd.print(radius * 2);
+  lcd.print("   ");
   lcd.setCursor(10, 0);
   lcd.print("/");
   lcd.setCursor(11, 0);
@@ -1226,13 +1407,15 @@ void measuring_results_circle() {
   lcd.print("Angle:");
   lcd.setCursor(6, 1);
   lcd.print(corner_sum);
+  lcd.print("   ");
   lcd.setCursor(19, 1);
   lcd.write(223);
 
   lcd.setCursor(0, 2);
   lcd.print("Pt:");
   lcd.setCursor(3, 2);
-  lcd.print(PS1.getPressure());
+  lcd.print(PS1.getPressure() - calibration);
+  lcd.print("   ");
   lcd.setCursor(18, 2);
   lcd.print("Pa");
 }
@@ -1243,24 +1426,25 @@ void lcd_print_x() {
     if (stepper_X.getStatus() == 0) {
       PS1.readSensor();
     }
-    lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("X position:");
     lcd.setCursor(0, 1);
-    lcd.print(x_position);
-    lcd.setCursor(8, 1);
+    lcd.print(x_position_abs);
+    lcd.print("    ");
+    lcd.setCursor(18, 1);
     lcd.print("mm");
     lcd.setCursor(0, 2);
     lcd.print("Pressure:");
     lcd.setCursor(0, 3);
-    lcd.print(PS1.getPressure());
-    lcd.setCursor(10, 3);
+    lcd.print(PS1.getPressure() - calibration);
+    lcd.print("    ");
+    lcd.setCursor(18, 3);
     lcd.print("Pa");
   }
 }
 
 void move_X() {
-  stepper_X.setTargetDeg(my_deg_X, ABSOLUTE);
+  stepper_X.setTargetDeg(my_deg_X_abs, ABSOLUTE);
   if (stepper_X.ready() == 0) {
     stepper_X.tick();
   }
@@ -1272,24 +1456,25 @@ void lcd_print_z() {
     if (stepper_Z.getStatus() == 0) {
       PS1.readSensor();
     }
-    lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Z position:");
     lcd.setCursor(0, 1);
-    lcd.print(z_position);
-    lcd.setCursor(8, 1);
+    lcd.print(z_position_abs);
+    lcd.print("    ");
+    lcd.setCursor(18, 1);
     lcd.print("mm");
     lcd.setCursor(0, 2);
     lcd.print("Pressure:");
     lcd.setCursor(0, 3);
-    lcd.print(PS1.getPressure());
-    lcd.setCursor(10, 3);
+    lcd.print(PS1.getPressure() - calibration);
+    lcd.print("    ");
+    lcd.setCursor(18, 3);
     lcd.print("Pa");
   }
 }
 
 void move_Z() {
-  stepper_Z.setTargetDeg(my_deg_Z, ABSOLUTE);
+  stepper_Z.setTargetDeg(my_deg_Z_abs, ABSOLUTE);
   if (stepper_Z.ready() == 0) {
     stepper_Z.tick();
   }
@@ -1357,6 +1542,8 @@ void menu_moveXYZ() {
   lcd.print("Move X");
   lcd.setCursor(1, 2);
   lcd.print("Move Z");
+  lcd.setCursor(1, 3);
+  lcd.print("Home");
 }
 
 void menu_move() {
@@ -1500,7 +1687,7 @@ void select_angle() {
 }
 
 void select_step_diameter() {
-  if (step_rad < 0) step_rad = 0;
+  if (step_rad < 0.0) step_rad = 0.0;
   if (step_rad > 100.0) step_rad = 100.0;
   counter = 0;
   lcd.clear();
@@ -1513,8 +1700,8 @@ void select_step_diameter() {
 }
 
 void select_diameter() {
-  if (diameter < 0) diameter = 0;
-  if (diameter > 500.0) diameter = 500.0;
+  if (diameter < 0.0) diameter = 0.0;
+  if (diameter > Z_max / 2) diameter = Z_max / 2;
   counter = 0;
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -1526,8 +1713,8 @@ void select_diameter() {
 }
 
 void select_x_measuring() {
-  if (x_measuring < 0) x_measuring = 0;
-  if (x_measuring > 500.0) x_measuring = 500.0;
+  if (x_measuring < 0.0) x_measuring = 0.0;
+  if (x_measuring > X_max) x_measuring = X_max;
   counter = 0;
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -1540,7 +1727,7 @@ void select_x_measuring() {
 
 void select_x_step() {
   x_step += counter * 0.1;
-  if (x_step < 0) x_step = 0;
+  if (x_step < 0.0) x_step = 0.0;
   if (x_step > x_measuring) x_step = x_measuring;
   counter = 0;
   lcd.clear();
@@ -1553,8 +1740,8 @@ void select_x_step() {
 }
 
 void select_z_measuring() {
-  if (z_measuring < 0) z_measuring = 0;
-  if (z_measuring > 500.0) z_measuring = 500.0;
+  if (z_measuring < 0.0) z_measuring = 0.0;
+  if (z_measuring > Z_max) z_measuring = Z_max;
   counter = 0;
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -1567,7 +1754,7 @@ void select_z_measuring() {
 
 void select_z_step() {
   z_step += counter * 0.1;
-  if (z_step < 0) z_step = 0;
+  if (z_step < 0.0) z_step = 0.0;
   if (z_step > z_measuring) z_step = z_measuring;
   counter = 0;
   lcd.clear();
@@ -1594,7 +1781,7 @@ void select_waiting() {
 
 void select_z_height_microstep() {
   z_height_microstep += counter * 0.1;
-  if (z_height_microstep < 0) z_height_microstep = 0;
+  if (z_height_microstep < 0.0) z_height_microstep = 0.0;
   if (z_height_microstep > (z_measuring / 2)) z_height_microstep = (z_measuring / 2);
   counter = 0;
   lcd.clear();
@@ -1608,7 +1795,7 @@ void select_z_height_microstep() {
 
 void select_z_step_microstep() {
   z_step_microstep += counter * 0.1;
-  if (z_step_microstep < 0) z_step_microstep = 0;
+  if (z_step_microstep < 0) z_step_microstep = 0.0;
   if (z_step_microstep > z_height_microstep) z_step_microstep = z_height_microstep;
   counter = 0;
   lcd.clear();
@@ -1643,17 +1830,61 @@ void write_to_card() {
     File dataFile = SD.open("results.csv", FILE_WRITE);
     if (dataFile) {
       if (mode == 4) {
+        dataFile.println("Powered by jRafik");
+        dataFile.println("All information https://github.com/jRafik/CNC-for-small-aero-ctand");
         dataFile.println("Along axis Z");
+        dataFile.print("X0= ");
+        dataFile.println(x_position_abs);
+        dataFile.print("Z0= ");
+        dataFile.println(z_position_abs);
+        dataFile.print("Z meazuring= ");
+        dataFile.println(z_measuring);
+        dataFile.print("Z step= ");
+        dataFile.println(z_step);
+        dataFile.print("Waiting= ");
+        dataFile.println(waiting);
+        dataFile.print("Z heigh microstep= ");
+        dataFile.println(z_height_microstep);
+        dataFile.print("Z microstep= ");
+        dataFile.println(z_step_microstep);
         dataFile.println("Pressure ; X ; Z");
         dataFile.close();
       }
       if (mode == 5) {
+        dataFile.println("Powered by jRafik");
+        dataFile.println("All information https://github.com/jRafik/CNC-for-small-aero-ctand");
         dataFile.println("Along plane XZ");
+        dataFile.print("X0= ");
+        dataFile.println(x_position_abs);
+        dataFile.print("Z0= ");
+        dataFile.println(z_position_abs);
+        dataFile.print("Z meazuring= ");
+        dataFile.println(z_measuring);
+        dataFile.print("Z step= ");
+        dataFile.println(z_step);
+        dataFile.print("Waiting= ");
+        dataFile.println(waiting);
+        dataFile.print("X measuring= ");
+        dataFile.println(x_measuring);
         dataFile.println("Pressure ; X ; Z");
         dataFile.close();
       }
       if (mode == 6) {
+        dataFile.println("Powered by jRafik");
+        dataFile.println("All information https://github.com/jRafik/CNC-for-small-aero-ctand");
         dataFile.println("Along circle XZ");
+        dataFile.print("X0= ");
+        dataFile.println(x_position_abs);
+        dataFile.print("Z0= ");
+        dataFile.println(z_position_abs);
+        dataFile.print("Diameter= ");
+        dataFile.println(diameter);
+        dataFile.print("Step diameter= ");
+        dataFile.println(step_rad);
+        dataFile.print("Angle= ");
+        dataFile.println(corner);
+        dataFile.print("Waiting= ");
+        dataFile.println(waiting);
         dataFile.println("Pressure ; X ; Z");
         dataFile.close();
       }
@@ -1661,7 +1892,7 @@ void write_to_card() {
     card_flag = 1;
   }
   results = " ";
-  results += PS1.getPressure();
+  results += PS1.getPressure() - calibration;
   results += ";";
   results += x_position;
   results += ";";
